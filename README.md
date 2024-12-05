@@ -1,6 +1,8 @@
 # mgc-token-tools
 > Token management tools for the Microsoft Graph CLI (`mgc`)
 
+!WIP! - This project is a work-in-progress and may not be functional. 
+
 ## Features
 - Print an access or refresh token from the OS keyring for a specific client (via the client id) to pass to another tool
 - [FOCI client](https://github.com/secureworks/family-of-client-ids-research/tree/main) login similar to `Invoke-RefreshTo<X>` commands provided by [TokenTactics](https://github.com/rvrsh3ll/TokenTactics)
