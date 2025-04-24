@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 
 import platform
-import uuid
 import base64
 import sys
 import json
 import argparse
+import binascii
 from enum import Enum
 import pathlib
 from subprocess import run, PIPE, STDOUT
 import shlex
-import os
-import pwd
 import urllib.request
 import urllib.parse
 import urllib.error
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias, Tuple, Literal
+from typing import Protocol, Literal, Self
 
 MSAL_KEYRING_ACCOUNT = "MicrosoftGraph.nocae"
 MSAL_KEYRING_LABEL = "MsalClientID"
 MSAL_KEYRING_SERVICE = "Microsoft.Developer.IdentityService"
 MS_GRAPH_API_BASE_URL = "https://graph.microsoft.com"
 MSO_LOGIN_URL = "https://login.microsoftonline.com"
+MSO_AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+MSO_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+AUTH_CODE_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 ENVIRONMENT_DOMAIN = "login.windows.net"
+
+LOGIN_CMD = "mgc login --client-id {client_id} --strategy {strategy}"
+LOGOUT_CMD = "mgc logout"
+MS_AZURE_POWERSHELL_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
+MAX_HELP_POSITION = 200
 
 # fmt: off
 # from https://github.com/secureworks/family-of-client-ids-research/blob/main/known-foci-clients.csv
@@ -52,14 +58,14 @@ class MgcCacheItem(Protocol):
     def as_cache_dict(self) -> dict: ...
 
     @classmethod
-    def init_from_cache(cls, item: dict): ...
+    def init_from_cache(cls, item: dict) -> Self: ...
 
 
 @dataclass
 class MgcToken(MgcCacheItem):
     tenant_id: str
-    client_id: str
     user_id: str
+    client_id: str
     secret: str
 
     @property
@@ -68,19 +74,23 @@ class MgcToken(MgcCacheItem):
 
     @property
     def home_account_id(self) -> str:
-        return f"{self.tenant_id}.{self.user_id}"
+        return f"{self.user_id}.{self.tenant_id}"
 
     @property
     def client_info(self) -> str:
-        return base64.urlsafe_b64encode(
-            str({"uid": self.user_id, "tid": self.tenant_id}).encode()
-        ).decode()
+        return (
+            base64.urlsafe_b64encode(
+                str({"uid": self.user_id, "tid": self.tenant_id}).encode()
+            )
+            .decode()
+            .rstrip("=")
+        )
 
     @classmethod
     def init_from_cache(cls, item: dict):
-        tenant_id = item["home_account_id"].split(".")[0]
-        user_id = item["home_account_id"].split(".")[1]
-        return MgcToken(
+        user_id = item["home_account_id"].split(".")[0]
+        tenant_id = item["home_account_id"].split(".")[1]
+        return cls(
             tenant_id=tenant_id,
             client_id=item["client_id"],
             user_id=user_id,
@@ -97,13 +107,19 @@ class MgcToken(MgcCacheItem):
             "credential_type": self.token_type,
             "realm": self.tenant_id,
         }
-        print(json.dumps(cache_entry, indent=2))
         return cache_entry
+
+    def json(self) -> dict:
+        return {
+            "tenant_id": self.tenant_id,
+            "type": self.token_type,
+            "client_id": self.client_id,
+        }
 
 
 @dataclass
 class MgcAccessToken(MgcToken, MgcCacheItem):
-    scopes: list[str] | None
+    scopes: list[str]
 
     @property
     def jwt_claims(self) -> dict:
@@ -127,9 +143,10 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
 
     @classmethod
     def init_from_cache(cls, item: dict):
-        tenant_id = item["home_account_id"].split(".")[0]
-        user_id = item["home_account_id"].split(".")[1]
-        scopes = []
+        user_id = item["home_account_id"].split(".")[0]
+        tenant_id = item["home_account_id"].split(".")[1]
+        claims = _parse_jwt_claims(item["secret"])
+        scopes = claims["scp"].split(" ")
         return MgcAccessToken(
             tenant_id=tenant_id,
             client_id=item["client_id"],
@@ -140,7 +157,6 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
 
     @classmethod
     def init_from_secret(cls, secret: str):
-        # claims = json.loads(base64.urlsafe_b64decode(secret.split(".")[1] + "==").decode("latin-1"))
         claims = _parse_jwt_claims(secret)
         return MgcAccessToken(
             tenant_id=claims["tid"],
@@ -150,7 +166,7 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
             scopes=claims["scp"].split(" "),
         )
 
-    def as_cache_dict(self) -> dict:
+    def as_cache_dict(self) -> dict[str, str]:
         cache_entry = {
             "home_account_id": self.home_account_id,
             "environment": ENVIRONMENT_DOMAIN,
@@ -160,23 +176,30 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
             "credential_type": self.token_type,
             "realm": self.tenant_id,
             "target": " ".join(self.scopes),
-            "cached_at": self.issued_at,
-            "expires_on": self.expires_on,
-            "extended_expires_on": self.expires_on,
-            "ext_expires_on": self.expires_on,
+            "cached_at": str(self.issued_at),
+            "expires_on": str(self.expires_on),
+            "extended_expires_on": str(self.expires_on),
+            "ext_expires_on": str(self.expires_on),
         }
-        print(json.dumps(cache_entry, indent=2))
         return cache_entry
 
 
 @dataclass
 class MgcRefreshToken(MgcToken, MgcCacheItem):
-    family_id: int
+    family_id: int  # foci = 1
+
+    @property
+    def _key(self) -> str:
+        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.REFRESH.value}-{self.family_id}--".lower()
+
+    @property
+    def key(self) -> str:
+        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
 
     @classmethod
     def init_from_cache(cls, item: dict):
-        tenant_id = item["home_account_id"].split(".")[0]
-        user_id = item["home_account_id"].split(".")[1]
+        user_id = item["home_account_id"].split(".")[0]
+        tenant_id = item["home_account_id"].split(".")[1]
         return MgcRefreshToken(
             tenant_id=tenant_id,
             client_id=item["client_id"],
@@ -193,16 +216,15 @@ class MgcRefreshToken(MgcToken, MgcCacheItem):
             "client_id": self.client_id,
             "secret": self.secret,
             "credential_type": self.token_type,
-            "family_id": self.family_id,
+            "family_id": str(self.family_id),
         }
-        print(json.dumps(cache_entry, indent=2))
         return cache_entry
 
 
 @dataclass
 class MgcIdToken(MgcToken, MgcCacheItem):
     @property
-    def jwt_claims(self) -> dict | None:
+    def jwt_claims(self) -> dict:
         return _parse_jwt_claims(self.secret)
 
     @property
@@ -211,7 +233,17 @@ class MgcIdToken(MgcToken, MgcCacheItem):
 
     @property
     def key(self) -> str:
-        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}".lower()
+        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
+
+    @classmethod
+    def init_from_secret(cls, secret: str, client_id: str):
+        claims = _parse_jwt_claims(secret)
+        return MgcIdToken(
+            tenant_id=claims["tid"],
+            user_id=claims["oid"],
+            client_id=client_id,
+            secret=secret,
+        )
 
 
 class RefreshResponse:
@@ -220,26 +252,52 @@ class RefreshResponse:
         self.scope: str = response["scope"]
         self.expires_in: str = response["expires_in"]
         self.ext_expires_in: str = response["ext_expires_in"]
-        self.expires_on: str = response["expires_on"]
-        self.not_before: str = response["not_before"]
-        self.resource: str = response["resources"]  # https://graph.microsoft.com
-        self.access_token: str = response["access_token"]
-        self.refresh_token: str = response["refresh_token"]
-        self.foci: str = response["foci"]
-        self.id_token: str = response["id_token"]
+        self.expires_on: str | None = response.get("expires_on")
+        self.not_before: str | None = response.get("not_before")
+        self.resource: str | None = response.get(
+            "resource"
+        )  # https://graph.microsoft.com
+        self.access_token: MgcAccessToken = MgcAccessToken.init_from_secret(
+            response["access_token"]
+        )
+        self.foci: int = int(response["foci"])
+        self.id_token: MgcIdToken = MgcIdToken(
+            tenant_id=self.access_token.tenant_id,
+            user_id=self.access_token.user_id,
+            secret=response["id_token"],
+            client_id=self.access_token.client_id,
+        )
+        self.refresh_token: MgcRefreshToken = MgcRefreshToken(
+            tenant_id=self.access_token.tenant_id,
+            user_id=self.access_token.user_id,
+            client_id=self.access_token.client_id,
+            secret=response["refresh_token"],
+            family_id=self.foci,
+        )
+
+
+def _client_id_to_name(client_id: str) -> str | None:
+    for client in FOCI_CLIENTS:
+        if client_id == client["client_id"]:
+            return client["app_name"]
 
 
 class MgcAuthRecord:
     def __init__(self):
         home = pathlib.Path.home()
-        with open(f"{home}/.mgc/authRecord", "r") as f:
-            auth_record = "\n".join(f.readlines())
-            auth_record = json.loads(auth_record)
+        try:
+            with open(f"{home}/.mgc/authRecord", "r") as f:
+                auth_record = "\n".join(f.readlines())
+                auth_record = json.loads(auth_record)
+        except FileNotFoundError:
+            raise AuthRecordNotFoundError()
+
         self.username: str = auth_record["username"]
         self.authority: str = auth_record["authority"]
         self.tenant_id: str = auth_record["tenantId"]
         self.client_id: str = auth_record["clientId"]
         self.user_id: str = auth_record["homeAccountId"].split(".")[0]
+        self.app_name: str | None = _client_id_to_name(self.client_id)
 
     def __str__(self) -> str:
         return str(self.__dict__)
@@ -247,7 +305,7 @@ class MgcAuthRecord:
     def __repr__(self) -> str:
         return str(self.__dict__)
 
-    def _commit_auth_record(self):
+    def _commit_auth_record(self) -> None:
         ar = {
             "username": self.username,
             "authority": self.authority,
@@ -257,8 +315,35 @@ class MgcAuthRecord:
             "version": "1.0",
         }
         home = pathlib.Path.home()
-        with open(f"{home}/.mgc/authRecord", "w") as f:
-            f.write(json.dumps(ar))
+        try:
+            with open(f"{home}/.mgc/authRecord", "w") as f:
+                f.write(json.dumps(ar))
+        except FileNotFoundError:
+            raise AuthRecordNotFoundError()
+
+    @classmethod
+    def _from_access_token(cls, token: MgcAccessToken) -> None:
+        ar = {
+            "username": token.username,
+            "authority": "login.microsoftonline.com",
+            "homeAccountId": f"{token.user_id}.{token.tenant_id}",
+            "tenantId": token.tenant_id,
+            "clientId": token.client_id,
+            "version": "1.0",
+        }
+        home = pathlib.Path.home()
+        try:
+            with open(f"{home}/.mgc/authRecord", "w") as f:
+                f.write(json.dumps(ar))
+        except FileNotFoundError:
+            raise AuthRecordNotFoundError()
+
+
+class AuthRecordNotFoundError(Exception):
+    def __init__(
+        self, message: str = "AuthRecord not found. Try using the login command first."
+    ):
+        super().__init__(message)
 
 
 class MgcCache:
@@ -279,7 +364,19 @@ class MgcCache:
         elif platform.system() == "Darwin":
             find_cmd = f'security find-generic-password -w -a "{MSAL_KEYRING_ACCOUNT}"'
             output = run(shlex.split(find_cmd), stdout=PIPE, stderr=STDOUT)
-            cache = json.loads(output.stdout.decode())
+            try:
+                cache = json.loads(output.stdout.decode())
+            except json.decoder.JSONDecodeError:
+                if "SecKeychainSearchCopyNext" in output.stdout.decode():
+                    # Create an empty keychain entry
+                    cache = {
+                        "AccessToken": {},
+                        "RefreshToken": {},
+                        "IdToken": {},
+                    }
+                else:
+                    print(f"Error: {output.stdout.decode()}")
+                    sys.exit(1)
         else:
             print(f"Error: Unsupported platform {platform.system()}")
             sys.exit(1)
@@ -287,7 +384,30 @@ class MgcCache:
         if cache is None:
             sys.exit(1)
 
-        self.content = cache
+        self.content: dict = cache
+
+    @property
+    def tokens(self) -> list[MgcToken]:
+        result = []
+        for _, v in self.content["AccessToken"].items():
+            token = MgcAccessToken.init_from_cache(v)
+            result.append(token)
+
+        for _, v in self.content["RefreshToken"].items():
+            token = MgcRefreshToken.init_from_cache(v)
+            result.append(token)
+
+        for _, v in self.content["IdToken"].items():
+            token = MgcIdToken.init_from_cache(v)
+            result.append(token)
+
+        result.sort(key=lambda x: x.tenant_id + x.client_id)
+
+        return result
+
+    @property
+    def refresh_count(self) -> int:
+        return sum(1 for i in self.tokens if i.token_type == TokenType.REFRESH.value)
 
     def _commit(self) -> None:
         # For some reason, keychain access will prompt for a keychain password for future mgc calls
@@ -295,11 +415,12 @@ class MgcCache:
         # ACL to include mgc.
 
         if platform.system() == "Darwin":
-            add_cmd = f"security add-generic-password -a '{MSAL_KEYRING_ACCOUNT}' -s '{MSAL_KEYRING_SERVICE}' -w '{self.content}' -U "  # -T '{mgc_path}"
+            add_cmd = f"security add-generic-password -a '{MSAL_KEYRING_ACCOUNT}' -s '{MSAL_KEYRING_SERVICE}' -w '{json.dumps(self.content)}' -U"  # -T '{mgc_path}"
             add_output = run(shlex.split(add_cmd), stdout=PIPE, stderr=STDOUT)
             print(add_output.stdout.decode())
 
-    def clear(self) -> None:
+    @classmethod
+    def clear(cls) -> None:
         if platform.system() == "Darwin":
             cmd = f"security delete-generic-password -a '{MSAL_KEYRING_ACCOUNT}' -s '{MSAL_KEYRING_SERVICE}'"
         elif platform.system() == "Linux":
@@ -310,7 +431,9 @@ class MgcCache:
         output = run(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
         print(output.stdout.decode())
 
-    def insert_token(self, secret: str, token_type: TokenType = TokenType.ACCESS):
+    def insert_token(
+        self, secret: str, token_type: TokenType = TokenType.ACCESS
+    ) -> None:
         if token_type == TokenType.ACCESS:
             token = MgcAccessToken.init_from_secret(secret)
             self.content[token.token_type][token.key] = token.as_cache_dict()
@@ -319,13 +442,34 @@ class MgcCache:
             print("Error: currently only access tokens are supported by this function.")
             sys.exit(1)
 
+    def insert_refresh_response(self, response: RefreshResponse) -> None:
+        self.content[TokenType.ACCESS.value][
+            response.access_token.key
+        ] = response.access_token.as_cache_dict()
+        self.content[TokenType.REFRESH.value][
+            response.refresh_token.key
+        ] = response.refresh_token.as_cache_dict()
+        self.content[TokenType.ID.value][
+            response.id_token.key
+        ] = response.id_token.as_cache_dict()
+        self._commit()
+
+    def get_token(
+        self, client_id: str, token_type: TokenType = TokenType.ACCESS
+    ) -> MgcToken | None:
+        for token in self.tokens:
+            if token.client_id == client_id and token.token_type == token_type.value:
+                return token
+
 
 # -- Utlities --
 def _parse_jwt_claims(jwt: str) -> dict:
     # split out claims from jwt and base64 decode into a dictoinary
     claims = jwt.split(".")[1]  # split jwt
-    # claims = base64.b64decode(claims + "==").decode("latin-1")
-    claims = base64.urlsafe_b64decode(claims).decode()
+    try:
+        claims = base64.urlsafe_b64decode(claims).decode()
+    except binascii.Error:  # incorrect padding
+        claims = base64.b64decode(claims + "==").decode()
     return json.loads(claims)
 
 
@@ -341,30 +485,121 @@ def _token_type_from_key(
             return TokenType.ID
 
 
-def print_tokens(raw: bool = True) -> None:
-    if raw:
-        cache = MgcCache()
+def print_tokens(format: str) -> None:
+    cache = MgcCache()
+    if format == "raw":
         tokens = cache.content
         print(json.dumps(tokens, indent=2))
     else:
-        for token in list_tokens():
-            print(token.__dict__)
+        tokens = [token.json() for token in cache.tokens]
+        if format == "json":
+            for token in tokens:
+                print(json.dumps(token, indent=2))
+        else:
+            print(
+                f"{'#': <5} {'tenant_id': <40} {'type': <20} {'client_id': <40} {'alias': <40}"
+            )
+            for i, token in enumerate(tokens):
+                alias = get_alias(token["client_id"]) or ""
+                print(
+                    f"{i: <5} {token['tenant_id']: <40} {token['type']: <20} {token['client_id']: <40} {alias: <40}"
+                )
+
+
+def run_mgc_cmd(cmd: str, env=None) -> dict | None:
+    output = run(shlex.split(cmd), stdout=PIPE, stderr=STDOUT, env=env)
+    if output.returncode != 0:
+        print(output.stdout.decode())
+        return None
+    else:
+        if output.stdout.decode() == "":
+            # For commands that dont output to stdout (ex: mgc login)
+            return None
+        else:
+            try:
+                result = json.loads(output.stdout.decode())["value"]
+                return result
+            except KeyError:
+                result = json.loads(output.stdout.decode())
+                return result
+
+
+def login(
+    client_id=MS_AZURE_POWERSHELL_CLIENT_ID, strategy="InteractiveBrowser", beta=False
+) -> None:
+    if beta:
+        version = "-beta"
+    else:
+        version = ""
+    if strategy in ["InteractiveBrowser", "interactive", "device_code"]:
+        run_mgc_cmd(
+            LOGIN_CMD.format(version=version, client_id=client_id, strategy=strategy)
+        )
+    else:
+        auth_token_login(client_id)
+
+
+def logout() -> None:
+    run_mgc_cmd(LOGOUT_CMD)
+    MgcCache.clear()
+
+
+def auth_token_flow(client_id, scope, auth_code) -> RefreshResponse:
+    data = {
+        "client_id": client_id,
+        "redirect_uri": AUTH_CODE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+        "scope": scope,
+        "code": auth_code,
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    }
+
+    r = urlreq("POST", MSO_TOKEN_URL, headers=headers, data=data)
+    r = RefreshResponse(json.loads(r))
+    return r
+
+
+def auth_token_login(client_id) -> None:
+    print()
+    scope = "openid offline_access"
+    resource = "https://graph.microsoft.com/.default"
+    data = {
+        "client_id": client_id,
+        "scope": f"{scope} {resource}",
+        "response_type": "code",
+        "redirect_uri": AUTH_CODE_REDIRECT_URI,
+    }
+    params = "&".join(
+        "{}={}".format(k, urllib.parse.quote_plus(v)) for k, v in data.items()
+    )
+    print(f"{MSO_AUTHORIZE_URL}?{params}")
+    response = input("Enter the url of the response page:\n")
+    parsed_query_string = urllib.parse.parse_qs(urllib.parse.urlparse(response).query)
+    code = parsed_query_string.get("code")
+    if code is not None:
+        code = code[0]
+        print(code)
+        r = auth_token_flow(client_id, f"{scope} {resource}", code)
+        MgcCache().insert_refresh_response(r)
 
 
 def urlreq(method: str, url: str, headers: dict = {}, data: dict | None = None) -> str:
-    """
-    Function for simple HTTP requests using urllib.requests
-    Ref: https://docs.python.org/3/howto/urllib2.html
-    """
-
-    encoded_data: bytes | None = None
+    encoded_data = None
     if data is not None:
         if method == "GET":
             # urlencode data as path parameters
-            params: str = urllib.parse.urlencode(data)
+            params = "&".join(
+                "{}={}".format(k, urllib.parse.quote_plus(v)) for k, v in data.items()
+            )
             url = f"{url}?{params}"
         else:
-            encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+            if headers.get("Content-Type") == "application/x-www-form-urlencoded":
+                encoded_data: bytes | None = urllib.parse.urlencode(data).encode()
+            else:
+                encoded_data: bytes | None = json.dumps(data).encode("utf-8")
 
     request = urllib.request.Request(
         url=url, data=encoded_data, headers=headers, method=method
@@ -374,36 +609,16 @@ def urlreq(method: str, url: str, headers: dict = {}, data: dict | None = None) 
         return response.read().decode("utf-8")
 
 
-def list_tokens() -> list[MgcToken]:
-    cache = MgcCache()
-    tokens = cache.content
-    result = []
-    for _, v in tokens["AccessToken"].items():
-        token = MgcAccessToken.init_from_cache(v)
-        result.append(token)
-
-    for _, v in tokens["RefreshToken"].items():
-        token = MgcRefreshToken.init_from_cache(v)
-        result.append(token)
-
-    for _, v in tokens["IdToken"].items():
-        token = MgcIdToken.init_from_cache(v)
-        result.append(token)
-
-    return result
-
-
-def dump_token(
-    client_id: str | None = None, token_type: TokenType = TokenType.ACCESS
-) -> str:
+def dump_token(client_id: str, token_type: TokenType = TokenType.ACCESS) -> str:
     """
     Returns the first available MSAL token if multiple apps have been logged into
     and no client_id is specified. Otherwise, it will return the token for the specified
     client_id if it exists.
     """
+    cache = MgcCache()
     secret = None
 
-    tokens = [token for token in list_tokens() if token_type.value == token.token_type]
+    tokens = [token for token in cache.tokens if token_type.value == token.token_type]
     if len(tokens) == 1 and client_id is None:
         secret = tokens[0].secret
     for item in tokens:
@@ -411,7 +626,9 @@ def dump_token(
             secret = item.secret
 
     if secret is None:
-        print("Error: No tokens found")
+        print(
+            f"Error: No {token_type.value} tokens found for client-id={client_id} (alias={get_alias(client_id)})"
+        )
         sys.exit(1)
     else:
         return secret
@@ -422,7 +639,7 @@ def foci_login(
     tenant_id: str,
     refresh_token: str | None = None,
     refresh_token_client_id: str | None = None,
-) -> dict:
+) -> RefreshResponse:
     """
     Use a refresh token present in the MSAL keyring entry to login as another foci app
     """
@@ -451,48 +668,22 @@ def foci_login(
             "refresh_token": refresh_token,
             "scope": "openid",
         }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+        }
         r = urlreq(
-            method="POST", url=f"{MSO_LOGIN_URL}/{tenant_id}/oauth2/token", data=payload
+            method="POST",
+            url=f"{MSO_LOGIN_URL}/{tenant_id}/oauth2/token",
+            headers=headers,
+            data=payload,
         )
-        return json.loads(r)
+        return RefreshResponse(response=json.loads(r))
     else:
         print(
             f"Error: The value supplied for new_client_id ({new_client_id}) is not a known foci client."
         )
         sys.exit(1)
-
-
-def foci_scope_enum(refresh_token_client_id: str, tenant_id: str) -> list:
-    result = []
-    refresh_token = dump_token(refresh_token_client_id, token_type=TokenType.REFRESH)
-    for client in FOCI_CLIENTS:
-        next_client = client["client_id"]
-
-        r = foci_login(
-            refresh_token=refresh_token,
-            new_client_id=next_client,
-            tenant_id=tenant_id,
-        )
-        print(r)
-        exit()
-        try:
-            scopes = r["scope"].split(" ")
-            success = True
-        except KeyError as e:
-            scopes = []
-            success = False
-
-        result.append(
-            {
-                "client_id": next_client,
-                "app_name": client["app_name"],
-                "scopes": scopes,
-                "foci": True,
-                "success": success,
-            }
-        )
-
-    return result
 
 
 # -- Cli --
@@ -501,7 +692,16 @@ CLIENT_ALIASES = [
         "alias": "msteams",
         "display_name": "Microsoft Teams",
         "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
-        "interactive_login": False,
+        "interactive_login": True,
+        "redirect_type": "nativeclient",
+        "foci": True,
+    },
+    {
+        "alias": "onedrive",
+        "display_name": "OneDrive SyncEngine",
+        "client_id": "ab9b8c07-8f02-4f72-87fa-80105867a763",
+        "interactive_login": True,
+        "redirect_type": "nativeclient",
         "foci": True,
     },
     {
@@ -512,7 +712,7 @@ CLIENT_ALIASES = [
         "foci": True,
     },
     {
-        "alias": "olm",
+        "alias": "outlook",
         "display_name": "Outlook Mobile",
         "client_id": "27922004-5251-4030-b22d-91ecd9a37ea4",
         "interactive_login": False,
@@ -523,13 +723,15 @@ CLIENT_ALIASES = [
         "display_name": "Microsoft Azure CLI",
         "client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
         "interactive_login": True,
+        "redirect_type": "localhost",
         "foci": True,
     },
     {
-        "alias": "azps",
+        "alias": "azpowershell",
         "display_name": "Microsoft Azure PowerShell",
         "client_id": "1950a258-227b-4e31-a9cf-717495945fc2",
         "interactive_login": True,
+        "redirect_type": "localhost",
         "foci": True,
     },
     {
@@ -537,56 +739,91 @@ CLIENT_ALIASES = [
         "display_name": "Visual Studio - Legacy",
         "client_id": "872cd9fa-d31f-45e0-9eab-6e460a02d1f1",
         "interactive_login": True,
+        "redirect_type": "localhost",
         "foci": True,
     },
 ]
 
 
-def cli() -> argparse.ArgumentParser:
+def get_alias(client_id: str) -> str | None:
+    for a in CLIENT_ALIASES:
+        if a["client_id"] == client_id:
+            return a["alias"]
+    else:
+        return None
+
+
+def get_client_id_from_alias(alias: str) -> str | None:
+    for a in CLIENT_ALIASES:
+        if a["alias"] == alias:
+            return a["client_id"]
+    else:
+        return None
+
+
+def _cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python mgc-utils.py",
         description="Utilities for the Microsoft Graph CLI (mgc)",
+        formatter_class=lambda prog: argparse.HelpFormatter(
+            prog, max_help_position=MAX_HELP_POSITION
+        ),
     )
     subparsers = parser.add_subparsers(dest="cmd", metavar="subcommand")
-    parser_list = subparsers.add_parser(
-        name="list-tokens", help="Print all MSAL tokens currently stored in the keyring"
+
+    # login subcommand
+    parser_login = subparsers.add_parser(
+        name="login",
+        help="Login to Microsoft Graph",
     )
+    parser_login.add_argument("-c", "--client-id", help="Client id to login as")
+    parser_login.add_argument(
+        "-s",
+        "--strategy",
+        default="InteractiveBrowser",
+        choices=["InteractiveBrowser", "DeviceCode", "AuthToken"],
+        help="Login flow type",
+    )
+
+    # logout subcommand
+    subparsers.add_parser(
+        name="logout",
+        help="Delete the token cache and authentication record",
+    )
+
+    # list subcommand
+    parser_list = subparsers.add_parser(
+        name="list", help="Print all MSAL tokens currently stored in the keyring"
+    )
+    parser_list.add_argument(
+        "-f",
+        "--format",
+        required=False,
+        default="table",
+        choices=["json", "table", "raw"],
+        help="Output format",
+    )
+
+    # list-aliases subcommand
     parser_aliases = subparsers.add_parser(
-        name="list-aliases",
+        name="aliases",
         help="List alias for application client ids",
     )
     parser_aliases.add_argument(
         "-f",
         "--format",
         required=False,
+        default="table",
         choices=["json", "table"],
         help="Output format",
     )
-    subparsers.add_parser(
-        name="clear-tokens", help="Clear MSAL tokens for the OS keyring"
-    )
-    parser_list.add_argument(
-        "-f",
-        "--format",
-        required=False,
-        choices=["json", "table"],
-        help="Output format",
-    )
-    parser_list.add_argument(
-        "-r",
-        "--raw",
-        required=False,
-        action=argparse.BooleanOptionalAction,
-        help="Print raw cache content instead of serialzed tokens",
-    )
+
+    # dump subcommand
     parser_dump = subparsers.add_parser(
-        name="dump-token", help="Print an MSAL token from the keyring"
+        name="dump", help="Print an MSAL token from the keyring"
     )
     parser_dump.add_argument(
-        "-c",
-        "--client-id",
-        required=False,
-        help="Azure client id",
+        "-c", "--client-id", required=False, help="Azure client id"
     )
     parser_dump.add_argument(
         "-t",
@@ -596,9 +833,21 @@ def cli() -> argparse.ArgumentParser:
         required=False,
         help="Token type to get - either a refresh token or an access token",
     )
-    subparsers.add_parser(name="foci-login", help="")
-    subparsers.add_parser(name="foci-scope-enum", help="")
-    parser_insert = subparsers.add_parser(name="insert-token", help="")
+
+    # refresh-to subcommand
+    parser_refresh = subparsers.add_parser(
+        name="refresh-to",
+        help="Pass a refresh token or use an existing cached refresh token to login to another foci client",
+    )
+    parser_refresh.add_argument(
+        "-c", "--client-id", required=True, help="Client id to login as"
+    )
+
+    # insert subcommand
+    parser_insert = subparsers.add_parser(
+        name="insert",
+        help="Insert a token aquired through other means into the token cache",
+    )
     parser_insert.add_argument(
         "-s",
         "--secret",
@@ -606,57 +855,115 @@ def cli() -> argparse.ArgumentParser:
         required=False,
         help="",
     )
+
+    # status subcommand
+    subparsers.add_parser(
+        name="status",
+        help="Print current client_id and tenant_id",
+    )
+
+    # switch-client subcommand
+    parser_switch = subparsers.add_parser(
+        name="switch",
+        help="Switch to another client with available access tokens",
+    )
+    parser_switch.add_argument(
+        "-c", "--client-id", required=True, help="Client id to login as"
+    )
+
     return parser
 
 
 if __name__ == "__main__":
-    args = cli().parse_args()
+    args = _cli().parse_args()
     if args.cmd:
+
+        # initialize auth record
+        try:
+            auth_record = MgcAuthRecord()
+        except AuthRecordNotFoundError as e:
+            if args.cmd in ["login", "logout"]:
+                auth_record = None
+            else:
+                print(f"Error: {e}")
+                exit(1)
+
+        # check if client-id is an alias
+        try:
+            if args.client_id is not None:
+                args.client_id = (
+                    get_client_id_from_alias(args.client_id) or args.client_id
+                )
+            else:
+                if auth_record is not None:
+                    args.client_id = auth_record.client_id
+        except AttributeError:
+            # args.client_id is not a valid argument for this subcommand
+            pass
+
+        # match command
         match args.cmd:
-            case "list-tokens":
-                print_tokens(args.raw)
-            case "list-aliases":
+            case "login":
+                if args.client_id:
+                    login(client_id=args.client_id, strategy=args.strategy)
+                else:
+                    login()
+
+            case "list":
+                print_tokens(args.format)
+
+            case "aliases":
                 if args.format == "json":
                     print(json.dumps(CLIENT_ALIASES, indent=2))
                 else:
+                    print(f"{'alias': <20} {'display_name': <30}")
                     for a in CLIENT_ALIASES:
-                        print(f"{a['alias']: <10} {a['display_name']: <30}")
-            case "clear-tokens":
-                MgcCache().clear()
-                print("Clearing keyring tokens...")
-            case "dump-token":
-                if args.client_id is not None:
-                    if args.client_id in CLIENT_ALIASES.keys():
-                        args.client_id = CLIENT_ALIASES[args.client_id]
+                        print(f"{a['alias']: <20} {a['display_name']: <30}")
+
+            case "logout":
+                logout()
+                print("Logged out.")
+
+            case "dump":
                 if args.token_type == "refresh":
                     token_type = TokenType.REFRESH
                 else:
                     token_type = TokenType.ACCESS
+
                 print(dump_token(client_id=args.client_id, token_type=token_type))
-            case "foci-login":
-                home = pathlib.Path.home()
-                with open(f"{home}/.mgc/authRecord", "r") as f:
-                    auth_record = "\n".join(f.readlines())
-                    auth_record = json.loads(auth_record)
-                tenant_id = auth_record["tenantId"]
-                username = auth_record["username"]
-                r = foci_login(
-                    refresh_token_client_id="872cd9fa-d31f-45e0-9eab-6e460a02d1f1",
-                    new_client_id="1950a258-227b-4e31-a9cf-717495945fc2",
-                    tenant_id=args.tenant_id,
-                )
-                print(json.dumps(r, indent=2))
-            case "foci-scope-enum":
-                r = foci_scope_enum(
-                    refresh_token_client_id="1950a258-227b-4e31-a9cf-717495945fc2",
-                    tenant_id=args.tenant_id,
-                )
-                print(json.dumps(r, indent=2))
-            case "insert-token":
-                print(args.secret)
+
+            case "refresh-to":
+                if auth_record is not None:
+                    r = foci_login(
+                        refresh_token_client_id=auth_record.client_id,
+                        new_client_id=args.client_id,
+                        tenant_id=auth_record.tenant_id,
+                    )
+                    m = MgcCache()
+                    m.insert_refresh_response(response=r)
+
+            case "insert":
                 MgcCache().insert_token(args.secret)
+
+            case "status":
+                status = auth_record.__dict__
+                token = MgcCache().get_token(status["client_id"])
+                if type(token) is MgcAccessToken:
+                    status["scopes"] = token.scopes
+                print(json.dumps(status, indent=2))
+
+            case "switch":
+                cache = MgcCache()
+                token = cache.get_token(args.client_id)
+                if token is not None:
+                    if type(token) is MgcAccessToken:
+                        auth_record = MgcAuthRecord._from_access_token(token)
+                else:
+                    print(f"No valid access token for client_id={args.client_id}")
+
             case _:
                 print("The command specified is not valid.")
+
     else:
-        cli().print_help(sys.stderr)
+        _cli().print_help(sys.stderr)
         sys.exit(1)
