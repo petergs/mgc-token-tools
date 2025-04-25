@@ -11,8 +11,8 @@ from enum import Enum
 from subprocess import PIPE, STDOUT, run
 from typing import Literal, Protocol, Self
 
-import constants as c
-from utils import urlreq
+from . import constants as c
+from .utils import urlreq
 
 
 # -- Cache and keychain interface classes --

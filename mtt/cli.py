@@ -4,8 +4,8 @@ import argparse
 import json
 import sys
 
-import constants as c
-from cache import (
+from . import constants as c
+from .cache import (
     MgcAccessToken,
     MgcAuthRecord,
     MgcCache,
@@ -130,7 +130,7 @@ def _cli() -> argparse.ArgumentParser:
     return parser
 
 
-if __name__ == "__main__":
+def main():
     args = _cli().parse_args()
     if args.cmd:
         # initialize auth record
@@ -222,3 +222,7 @@ if __name__ == "__main__":
     else:
         _cli().print_help(sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
