@@ -1,9 +1,9 @@
 [project]
 name = "mgc-token-tools"
-version = "0.1.1"
+version = "0.1.2"
 description = "Token management tools for the Microsoft Graph CLI (mgc)"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]

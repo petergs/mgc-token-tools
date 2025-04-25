@@ -22,8 +22,8 @@ from .cache import (
 
 def _cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python mgc-utils.py",
-        description="Utilities for the Microsoft Graph CLI (mgc)",
+        prog="mtt",
+        description="Token management tools for the Microsoft Graph CLI (mgc)",
     )
     subparsers = parser.add_subparsers(dest="cmd", metavar="subcommand")
 
