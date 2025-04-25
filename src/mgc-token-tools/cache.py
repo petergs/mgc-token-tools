@@ -1,41 +1,18 @@
-#!/usr/bin/env python3
-
-import platform
 import base64
-import sys
-import json
-import argparse
 import binascii
-from enum import Enum
+import json
 import pathlib
-from subprocess import run, PIPE, STDOUT
+import platform
 import shlex
-import urllib.request
+import sys
 import urllib.parse
-import urllib.error
 from dataclasses import dataclass
-from typing import Protocol, Literal, Self
+from enum import Enum
+from subprocess import PIPE, STDOUT, run
+from typing import Literal, Protocol, Self
 
-MSAL_KEYRING_ACCOUNT = "MicrosoftGraph.nocae"
-MSAL_KEYRING_LABEL = "MsalClientID"
-MSAL_KEYRING_SERVICE = "Microsoft.Developer.IdentityService"
-MS_GRAPH_API_BASE_URL = "https://graph.microsoft.com"
-MSO_LOGIN_URL = "https://login.microsoftonline.com"
-MSO_AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-MSO_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-AUTH_CODE_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
-ENVIRONMENT_DOMAIN = "login.windows.net"
-
-LOGIN_CMD = "mgc login --client-id {client_id} --strategy {strategy}"
-LOGOUT_CMD = "mgc logout"
-MS_AZURE_POWERSHELL_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
-MAX_HELP_POSITION = 200
-
-# fmt: off
-# from https://github.com/secureworks/family-of-client-ids-research/blob/main/known-foci-clients.csv
-# formatting turned off to reduce loc footprint of this declaration
-FOCI_CLIENTS = [{"client_id": "1950a258-227b-4e31-a9cf-717495945fc2","app_name": "Microsoft Azure PowerShell",},{"client_id": "00b41c95-dab0-4487-9791-b9d2c32c80f2","app_name": "Office 365 Management",},{"client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46","app_name": "Microsoft Azure CLI",},{"client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264","app_name": "Microsoft Teams",},{"client_id": "26a7ee05-5602-4d76-a7ba-eae8b7b67941","app_name": "Windows Search",},{"client_id": "27922004-5251-4030-b22d-91ecd9a37ea4","app_name": "Outlook Mobile",},{"client_id": "4813382a-8fa7-425e-ab75-3b753aab3abb","app_name": "Microsoft Authenticator App",},{"client_id": "ab9b8c07-8f02-4f72-87fa-80105867a763","app_name": "OneDrive SyncEngine",},{"client_id": "d3590ed6-52b3-4102-aeff-aad2292ab01c","app_name": "Microsoft Office",},{"client_id": "872cd9fa-d31f-45e0-9eab-6e460a02d1f1","app_name": "Visual Studio",},{"client_id": "af124e86-4e96-495a-b70a-90f90ab96707","app_name": "OneDrive iOS App",},{"client_id": "2d7f3606-b07d-41d1-b9d2-0d0c9296a6e8","app_name": "Microsoft Bing Search for Microsoft Edge",},{"client_id": "844cca35-0656-46ce-b636-13f48b0eecbd","app_name": "Microsoft Stream Mobile Native",},{"client_id": "87749df4-7ccf-48f8-aa87-704bad0e0e16","app_name": "Microsoft Teams - Device Admin Agent",},{"client_id": "cf36b471-5b44-428c-9ce7-313bf84528de","app_name": "Microsoft Bing Search",},{"client_id": "0ec893e0-5785-4de6-99da-4ed124e5296c","app_name": "Office UWP PWA",},{"client_id": "22098786-6e16-43cc-a27d-191a01a1e3b5","app_name": "Microsoft To-Do client",},{"client_id": "4e291c71-d680-4d0e-9640-0a3358e31177", "app_name": "PowerApps"},{"client_id": "57336123-6e14-4acc-8dcf-287b6088aa28","app_name": "Microsoft Whiteboard Client",},{"client_id": "57fcbcfa-7cee-4eb1-8b25-12d2030b4ee0","app_name": "Microsoft Flow",},{"client_id": "66375f6b-983f-4c2c-9701-d680650f588f","app_name": "Microsoft Planner",},{"client_id": "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223","app_name": "Microsoft Intune Company Portal",},{"client_id": "a40d7d7d-59aa-447e-a655-679a4107e548","app_name": "Accounts Control UI",},{"client_id": "a569458c-7f2b-45cb-bab9-b7dee514d112","app_name": "Yammer iPhone",},{"client_id": "b26aadf8-566f-4478-926f-589f601d9c74", "app_name": "OneDrive"},{"client_id": "c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12","app_name": "Microsoft Power BI",},{"client_id": "d326c1ce-6cc6-4de2-bebc-4591e5e13ef0", "app_name": "SharePoint"},{"client_id": "e9c51622-460d-4d3d-952d-966a5b1da34c","app_name": "Microsoft Edge",},{"client_id": "eb539595-3fe1-474e-9c1d-feb3625d1be5","app_name": "Microsoft Tunnel",},{"client_id": "ecd6b820-32c2-49b6-98a6-444530e5a77a","app_name": "Microsoft Edge",},{"client_id": "f05ff7c9-f75a-4acd-a3b5-f4b6a870245d","app_name": "SharePoint Android",},{"client_id": "f44b1140-bc5e-48c6-8dc0-5cf5a53c0e34","app_name": "Microsoft Edge",},{"client_id": "be1918be-3fe3-4be9-b32b-b542fc27f02e","app_name": "M365 Compliance Drive Client",},{"client_id": "cab96880-db5b-4e15-90a7-f3f1d62ffe39","app_name": "Microsoft Defender Platform",},{"client_id": "d7b530a4-7680-4c23-a8bf-c52c121d2e87","app_name": "Microsoft Edge Enterprise New Tab Page",},{"client_id": "dd47d17a-3194-4d86-bfd5-c6ae6f5651e3","app_name": "Microsoft Defender for Mobile",},{"client_id": "e9b154d0-7658-433b-bb25-6b8e0a8a7c59","app_name": "Outlook Lite",},]
-# fmt: on
+import constants as c
+from utils import urlreq
 
 
 # -- Cache and keychain interface classes --
@@ -100,7 +77,7 @@ class MgcToken(MgcCacheItem):
     def as_cache_dict(self) -> dict:
         cache_entry = {
             "home_account_id": self.home_account_id,
-            "environment": ENVIRONMENT_DOMAIN,
+            "environment": c.ENVIRONMENT_DOMAIN,
             "client_info": self.client_info,
             "client_id": self.client_id,
             "secret": self.secret,
@@ -139,7 +116,7 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
 
     @property
     def key(self) -> str:
-        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ACCESS.value}-{self.client_id}-{self.tenant_id}-{" ".join(self.scopes)}".lower()
+        return f"{self.home_account_id}-{c.ENVIRONMENT_DOMAIN}-{TokenType.ACCESS.value}-{self.client_id}-{self.tenant_id}-{' '.join(self.scopes)}".lower()
 
     @classmethod
     def init_from_cache(cls, item: dict):
@@ -169,7 +146,7 @@ class MgcAccessToken(MgcToken, MgcCacheItem):
     def as_cache_dict(self) -> dict[str, str]:
         cache_entry = {
             "home_account_id": self.home_account_id,
-            "environment": ENVIRONMENT_DOMAIN,
+            "environment": c.ENVIRONMENT_DOMAIN,
             "client_info": self.client_info,
             "client_id": self.client_id,
             "secret": self.secret,
@@ -190,11 +167,11 @@ class MgcRefreshToken(MgcToken, MgcCacheItem):
 
     @property
     def _key(self) -> str:
-        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.REFRESH.value}-{self.family_id}--".lower()
+        return f"{self.home_account_id}-{c.ENVIRONMENT_DOMAIN}-{TokenType.REFRESH.value}-{self.family_id}--".lower()
 
     @property
     def key(self) -> str:
-        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
+        return f"{self.home_account_id}-{c.ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
 
     @classmethod
     def init_from_cache(cls, item: dict):
@@ -211,7 +188,7 @@ class MgcRefreshToken(MgcToken, MgcCacheItem):
     def as_cache_dict(self) -> dict:
         cache_entry = {
             "home_account_id": self.home_account_id,
-            "environment": ENVIRONMENT_DOMAIN,
+            "environment": c.ENVIRONMENT_DOMAIN,
             "client_info": self.client_info,
             "client_id": self.client_id,
             "secret": self.secret,
@@ -233,7 +210,7 @@ class MgcIdToken(MgcToken, MgcCacheItem):
 
     @property
     def key(self) -> str:
-        return f"{self.home_account_id}-{ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
+        return f"{self.home_account_id}-{c.ENVIRONMENT_DOMAIN}-{TokenType.ID.value}-{self.client_id}-{self.tenant_id}-".lower()
 
     @classmethod
     def init_from_secret(cls, secret: str, client_id: str):
@@ -277,7 +254,7 @@ class RefreshResponse:
 
 
 def _client_id_to_name(client_id: str) -> str | None:
-    for client in FOCI_CLIENTS:
+    for client in c.FOCI_CLIENTS:
         if client_id == client["client_id"]:
             return client["app_name"]
 
@@ -357,12 +334,16 @@ class MgcCache:
 
     def __init__(self):
         if platform.system() == "Linux":
-            find_cmd = f"secret-tool lookup {MSAL_KEYRING_LABEL} {MSAL_KEYRING_SERVICE}"
+            find_cmd = (
+                f"secret-tool lookup {c.MSAL_KEYRING_LABEL} {c.MSAL_KEYRING_SERVICE}"
+            )
             output = run(shlex.split(find_cmd), stdout=PIPE, stderr=STDOUT)
             cache = base64.urlsafe_b64decode(output.stdout.decode()).decode("utf-8")
             cache = json.loads(cache)
         elif platform.system() == "Darwin":
-            find_cmd = f'security find-generic-password -w -a "{MSAL_KEYRING_ACCOUNT}"'
+            find_cmd = (
+                f'security find-generic-password -w -a "{c.MSAL_KEYRING_ACCOUNT}"'
+            )
             output = run(shlex.split(find_cmd), stdout=PIPE, stderr=STDOUT)
             try:
                 cache = json.loads(output.stdout.decode())
@@ -415,16 +396,16 @@ class MgcCache:
         # ACL to include mgc.
 
         if platform.system() == "Darwin":
-            add_cmd = f"security add-generic-password -a '{MSAL_KEYRING_ACCOUNT}' -s '{MSAL_KEYRING_SERVICE}' -w '{json.dumps(self.content)}' -U"  # -T '{mgc_path}"
+            add_cmd = f"security add-generic-password -a '{c.MSAL_KEYRING_ACCOUNT}' -s '{c.MSAL_KEYRING_SERVICE}' -w '{json.dumps(self.content)}' -U"  # -T '{mgc_path}"
             add_output = run(shlex.split(add_cmd), stdout=PIPE, stderr=STDOUT)
             print(add_output.stdout.decode())
 
     @classmethod
     def clear(cls) -> None:
         if platform.system() == "Darwin":
-            cmd = f"security delete-generic-password -a '{MSAL_KEYRING_ACCOUNT}' -s '{MSAL_KEYRING_SERVICE}'"
+            cmd = f"security delete-generic-password -a '{c.MSAL_KEYRING_ACCOUNT}' -s '{c.MSAL_KEYRING_SERVICE}'"
         elif platform.system() == "Linux":
-            cmd = f""
+            cmd = ""
         else:
             print(f"Error: unsupported platform {platform.system()} for `clear`")
             sys.exit(1)
@@ -443,15 +424,15 @@ class MgcCache:
             sys.exit(1)
 
     def insert_refresh_response(self, response: RefreshResponse) -> None:
-        self.content[TokenType.ACCESS.value][
-            response.access_token.key
-        ] = response.access_token.as_cache_dict()
-        self.content[TokenType.REFRESH.value][
-            response.refresh_token.key
-        ] = response.refresh_token.as_cache_dict()
-        self.content[TokenType.ID.value][
-            response.id_token.key
-        ] = response.id_token.as_cache_dict()
+        self.content[TokenType.ACCESS.value][response.access_token.key] = (
+            response.access_token.as_cache_dict()
+        )
+        self.content[TokenType.REFRESH.value][response.refresh_token.key] = (
+            response.refresh_token.as_cache_dict()
+        )
+        self.content[TokenType.ID.value][response.id_token.key] = (
+            response.id_token.as_cache_dict()
+        )
         self._commit()
 
     def get_token(
@@ -525,7 +506,7 @@ def run_mgc_cmd(cmd: str, env=None) -> dict | None:
 
 
 def login(
-    client_id=MS_AZURE_POWERSHELL_CLIENT_ID, strategy="InteractiveBrowser", beta=False
+    client_id=c.MS_AZURE_POWERSHELL_CLIENT_ID, strategy="InteractiveBrowser", beta=False
 ) -> None:
     if beta:
         version = "-beta"
@@ -533,21 +514,21 @@ def login(
         version = ""
     if strategy in ["InteractiveBrowser", "interactive", "device_code"]:
         run_mgc_cmd(
-            LOGIN_CMD.format(version=version, client_id=client_id, strategy=strategy)
+            c.LOGIN_CMD.format(version=version, client_id=client_id, strategy=strategy)
         )
     else:
         auth_token_login(client_id)
 
 
 def logout() -> None:
-    run_mgc_cmd(LOGOUT_CMD)
+    run_mgc_cmd(c.LOGOUT_CMD)
     MgcCache.clear()
 
 
 def auth_token_flow(client_id, scope, auth_code) -> RefreshResponse:
     data = {
         "client_id": client_id,
-        "redirect_uri": AUTH_CODE_REDIRECT_URI,
+        "redirect_uri": c.AUTH_CODE_REDIRECT_URI,
         "grant_type": "authorization_code",
         "scope": scope,
         "code": auth_code,
@@ -557,7 +538,7 @@ def auth_token_flow(client_id, scope, auth_code) -> RefreshResponse:
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
     }
 
-    r = urlreq("POST", MSO_TOKEN_URL, headers=headers, data=data)
+    r = urlreq("POST", c.MSO_TOKEN_URL, headers=headers, data=data)
     r = RefreshResponse(json.loads(r))
     return r
 
@@ -570,12 +551,12 @@ def auth_token_login(client_id) -> None:
         "client_id": client_id,
         "scope": f"{scope} {resource}",
         "response_type": "code",
-        "redirect_uri": AUTH_CODE_REDIRECT_URI,
+        "redirect_uri": c.AUTH_CODE_REDIRECT_URI,
     }
     params = "&".join(
         "{}={}".format(k, urllib.parse.quote_plus(v)) for k, v in data.items()
     )
-    print(f"{MSO_AUTHORIZE_URL}?{params}")
+    print(f"{c.MSO_AUTHORIZE_URL}?{params}")
     response = input("Enter the url of the response page:\n")
     parsed_query_string = urllib.parse.parse_qs(urllib.parse.urlparse(response).query)
     code = parsed_query_string.get("code")
@@ -584,29 +565,6 @@ def auth_token_login(client_id) -> None:
         print(code)
         r = auth_token_flow(client_id, f"{scope} {resource}", code)
         MgcCache().insert_refresh_response(r)
-
-
-def urlreq(method: str, url: str, headers: dict = {}, data: dict | None = None) -> str:
-    encoded_data = None
-    if data is not None:
-        if method == "GET":
-            # urlencode data as path parameters
-            params = "&".join(
-                "{}={}".format(k, urllib.parse.quote_plus(v)) for k, v in data.items()
-            )
-            url = f"{url}?{params}"
-        else:
-            if headers.get("Content-Type") == "application/x-www-form-urlencoded":
-                encoded_data: bytes | None = urllib.parse.urlencode(data).encode()
-            else:
-                encoded_data: bytes | None = json.dumps(data).encode("utf-8")
-
-    request = urllib.request.Request(
-        url=url, data=encoded_data, headers=headers, method=method
-    )
-
-    with urllib.request.urlopen(request) as response:
-        return response.read().decode("utf-8")
 
 
 def dump_token(client_id: str, token_type: TokenType = TokenType.ACCESS) -> str:
@@ -643,7 +601,7 @@ def foci_login(
     """
     Use a refresh token present in the MSAL keyring entry to login as another foci app
     """
-    foci_client_ids = [x["client_id"] for x in FOCI_CLIENTS]
+    foci_client_ids = [x["client_id"] for x in c.FOCI_CLIENTS]
     if refresh_token is None and refresh_token_client_id is None:
         print(
             "Error: foci_login expects either a refresh_token or a refresh_token_client_id"
@@ -662,7 +620,7 @@ def foci_login(
 
     if new_client_id in foci_client_ids:
         payload = {
-            "resource": MS_GRAPH_API_BASE_URL,
+            "resource": c.MS_GRAPH_API_BASE_URL,
             "client_id": new_client_id,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -674,7 +632,7 @@ def foci_login(
         }
         r = urlreq(
             method="POST",
-            url=f"{MSO_LOGIN_URL}/{tenant_id}/oauth2/token",
+            url=f"{c.MSO_LOGIN_URL}/{tenant_id}/oauth2/token",
             headers=headers,
             data=payload,
         )
@@ -686,67 +644,8 @@ def foci_login(
         sys.exit(1)
 
 
-# -- Cli --
-CLIENT_ALIASES = [
-    {
-        "alias": "msteams",
-        "display_name": "Microsoft Teams",
-        "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
-        "interactive_login": True,
-        "redirect_type": "nativeclient",
-        "foci": True,
-    },
-    {
-        "alias": "onedrive",
-        "display_name": "OneDrive SyncEngine",
-        "client_id": "ab9b8c07-8f02-4f72-87fa-80105867a763",
-        "interactive_login": True,
-        "redirect_type": "nativeclient",
-        "foci": True,
-    },
-    {
-        "alias": "msoffice",
-        "display_name": "Microsoft Office",
-        "client_id": "d3590ed6-52b3-4102-aeff-aad2292ab01c",
-        "interactive_login": False,
-        "foci": True,
-    },
-    {
-        "alias": "outlook",
-        "display_name": "Outlook Mobile",
-        "client_id": "27922004-5251-4030-b22d-91ecd9a37ea4",
-        "interactive_login": False,
-        "foci": True,
-    },
-    {
-        "alias": "azcli",
-        "display_name": "Microsoft Azure CLI",
-        "client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-        "interactive_login": True,
-        "redirect_type": "localhost",
-        "foci": True,
-    },
-    {
-        "alias": "azpowershell",
-        "display_name": "Microsoft Azure PowerShell",
-        "client_id": "1950a258-227b-4e31-a9cf-717495945fc2",
-        "interactive_login": True,
-        "redirect_type": "localhost",
-        "foci": True,
-    },
-    {
-        "alias": "vs",
-        "display_name": "Visual Studio - Legacy",
-        "client_id": "872cd9fa-d31f-45e0-9eab-6e460a02d1f1",
-        "interactive_login": True,
-        "redirect_type": "localhost",
-        "foci": True,
-    },
-]
-
-
 def get_alias(client_id: str) -> str | None:
-    for a in CLIENT_ALIASES:
+    for a in c.CLIENT_ALIASES:
         if a["client_id"] == client_id:
             return a["alias"]
     else:
@@ -754,216 +653,8 @@ def get_alias(client_id: str) -> str | None:
 
 
 def get_client_id_from_alias(alias: str) -> str | None:
-    for a in CLIENT_ALIASES:
+    for a in c.CLIENT_ALIASES:
         if a["alias"] == alias:
             return a["client_id"]
     else:
         return None
-
-
-def _cli() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="python mgc-utils.py",
-        description="Utilities for the Microsoft Graph CLI (mgc)",
-        formatter_class=lambda prog: argparse.HelpFormatter(
-            prog, max_help_position=MAX_HELP_POSITION
-        ),
-    )
-    subparsers = parser.add_subparsers(dest="cmd", metavar="subcommand")
-
-    # login subcommand
-    parser_login = subparsers.add_parser(
-        name="login",
-        help="Login to Microsoft Graph",
-    )
-    parser_login.add_argument("-c", "--client-id", help="Client id to login as")
-    parser_login.add_argument(
-        "-s",
-        "--strategy",
-        default="InteractiveBrowser",
-        choices=["InteractiveBrowser", "DeviceCode", "AuthToken"],
-        help="Login flow type",
-    )
-
-    # logout subcommand
-    subparsers.add_parser(
-        name="logout",
-        help="Delete the token cache and authentication record",
-    )
-
-    # list subcommand
-    parser_list = subparsers.add_parser(
-        name="list", help="Print all MSAL tokens currently stored in the keyring"
-    )
-    parser_list.add_argument(
-        "-f",
-        "--format",
-        required=False,
-        default="table",
-        choices=["json", "table", "raw"],
-        help="Output format",
-    )
-
-    # list-aliases subcommand
-    parser_aliases = subparsers.add_parser(
-        name="aliases",
-        help="List alias for application client ids",
-    )
-    parser_aliases.add_argument(
-        "-f",
-        "--format",
-        required=False,
-        default="table",
-        choices=["json", "table"],
-        help="Output format",
-    )
-
-    # dump subcommand
-    parser_dump = subparsers.add_parser(
-        name="dump", help="Print an MSAL token from the keyring"
-    )
-    parser_dump.add_argument(
-        "-c", "--client-id", required=False, help="Azure client id"
-    )
-    parser_dump.add_argument(
-        "-t",
-        "--token-type",
-        default="access",
-        choices=["access", "refresh"],
-        required=False,
-        help="Token type to get - either a refresh token or an access token",
-    )
-
-    # refresh-to subcommand
-    parser_refresh = subparsers.add_parser(
-        name="refresh-to",
-        help="Pass a refresh token or use an existing cached refresh token to login to another foci client",
-    )
-    parser_refresh.add_argument(
-        "-c", "--client-id", required=True, help="Client id to login as"
-    )
-
-    # insert subcommand
-    parser_insert = subparsers.add_parser(
-        name="insert",
-        help="Insert a token aquired through other means into the token cache",
-    )
-    parser_insert.add_argument(
-        "-s",
-        "--secret",
-        default=(None if sys.stdin.isatty() else sys.stdin.readline().rstrip()),
-        required=False,
-        help="",
-    )
-
-    # status subcommand
-    subparsers.add_parser(
-        name="status",
-        help="Print current client_id and tenant_id",
-    )
-
-    # switch-client subcommand
-    parser_switch = subparsers.add_parser(
-        name="switch",
-        help="Switch to another client with available access tokens",
-    )
-    parser_switch.add_argument(
-        "-c", "--client-id", required=True, help="Client id to login as"
-    )
-
-    return parser
-
-
-if __name__ == "__main__":
-    args = _cli().parse_args()
-    if args.cmd:
-
-        # initialize auth record
-        try:
-            auth_record = MgcAuthRecord()
-        except AuthRecordNotFoundError as e:
-            if args.cmd in ["login", "logout"]:
-                auth_record = None
-            else:
-                print(f"Error: {e}")
-                exit(1)
-
-        # check if client-id is an alias
-        try:
-            if args.client_id is not None:
-                args.client_id = (
-                    get_client_id_from_alias(args.client_id) or args.client_id
-                )
-            else:
-                if auth_record is not None:
-                    args.client_id = auth_record.client_id
-        except AttributeError:
-            # args.client_id is not a valid argument for this subcommand
-            pass
-
-        # match command
-        match args.cmd:
-            case "login":
-                if args.client_id:
-                    login(client_id=args.client_id, strategy=args.strategy)
-                else:
-                    login()
-
-            case "list":
-                print_tokens(args.format)
-
-            case "aliases":
-                if args.format == "json":
-                    print(json.dumps(CLIENT_ALIASES, indent=2))
-                else:
-                    print(f"{'alias': <20} {'display_name': <30}")
-                    for a in CLIENT_ALIASES:
-                        print(f"{a['alias']: <20} {a['display_name']: <30}")
-
-            case "logout":
-                logout()
-                print("Logged out.")
-
-            case "dump":
-                if args.token_type == "refresh":
-                    token_type = TokenType.REFRESH
-                else:
-                    token_type = TokenType.ACCESS
-
-                print(dump_token(client_id=args.client_id, token_type=token_type))
-
-            case "refresh-to":
-                if auth_record is not None:
-                    r = foci_login(
-                        refresh_token_client_id=auth_record.client_id,
-                        new_client_id=args.client_id,
-                        tenant_id=auth_record.tenant_id,
-                    )
-                    m = MgcCache()
-                    m.insert_refresh_response(response=r)
-
-            case "insert":
-                MgcCache().insert_token(args.secret)
-
-            case "status":
-                status = auth_record.__dict__
-                token = MgcCache().get_token(status["client_id"])
-                if type(token) is MgcAccessToken:
-                    status["scopes"] = token.scopes
-                print(json.dumps(status, indent=2))
-
-            case "switch":
-                cache = MgcCache()
-                token = cache.get_token(args.client_id)
-                if token is not None:
-                    if type(token) is MgcAccessToken:
-                        auth_record = MgcAuthRecord._from_access_token(token)
-                else:
-                    print(f"No valid access token for client_id={args.client_id}")
-
-            case _:
-                print("The command specified is not valid.")
-
-    else:
-        _cli().print_help(sys.stderr)
-        sys.exit(1)
